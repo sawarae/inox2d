@@ -216,7 +216,7 @@ impl HeadlessRenderer {
 		};
 
 		gl_renderer.resize(width, height);
-		gl_renderer.camera.scale = Vec2::splat(0.15);
+		gl_renderer.camera.scale = Self::scale_for_size(width, height);
 
 		// Direct the renderer's composite output to our FBO instead of framebuffer 0
 		gl_renderer.set_target_framebuffer(Some(fbo));
@@ -231,6 +231,15 @@ impl HeadlessRenderer {
 			height,
 			_gl_state: gl_state,
 		})
+	}
+
+	/// Camera scale proportional to viewport size.
+	/// 0.15 at 800px is the reference; scale linearly with the smaller dimension.
+	fn scale_for_size(width: u32, height: u32) -> Vec2 {
+		let base = 800.0_f32;
+		let base_scale = 0.15_f32;
+		let factor = width.min(height) as f32 / base;
+		Vec2::splat(base_scale * factor)
 	}
 
 	/// Resize the FBO and renderer viewport.
@@ -264,6 +273,7 @@ impl HeadlessRenderer {
 		}
 
 		self.gl_renderer.resize(width, height);
+		self.gl_renderer.camera.scale = Self::scale_for_size(width, height);
 	}
 
 	/// Render the puppet to PNG bytes.
