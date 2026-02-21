@@ -127,9 +127,27 @@ pub struct OpenglRenderer {
 	composite_mask_shader: CompositeMaskShader,
 
 	textures: Vec<Texture>,
+
+	/// Target framebuffer for final output. `None` means the default framebuffer (0).
+	/// Set this to render into a custom FBO instead of the screen.
+	target_framebuffer: Option<glow::Framebuffer>,
 }
 
 impl OpenglRenderer {
+	/// Access the underlying glow context.
+	pub fn gl(&self) -> &glow::Context {
+		&self.gl
+	}
+
+	/// Set the target framebuffer for final output.
+	///
+	/// By default the renderer outputs to framebuffer 0 (the screen).
+	/// For offscreen/headless rendering, set this to your custom FBO
+	/// so that composite results are written there instead.
+	pub fn set_target_framebuffer(&mut self, fbo: Option<glow::Framebuffer>) {
+		self.target_framebuffer = fbo;
+	}
+
 	/// Given a Model, create an OpenglRenderer:
 	/// - Setup buffers and shaders.
 	/// - Decode textures.
@@ -211,6 +229,8 @@ impl OpenglRenderer {
 				composite_mask_shader,
 
 				textures,
+
+				target_framebuffer: None,
 			};
 
 			// Set emission strength once (it doesn't change anywhere else)
@@ -367,7 +387,7 @@ impl OpenglRenderer {
 			0,
 		);
 
-		gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+		gl.bind_framebuffer(glow::FRAMEBUFFER, self.target_framebuffer);
 	}
 
 	pub fn resize(&mut self, w: u32, h: u32) {
@@ -580,7 +600,7 @@ impl InoxRenderer for OpenglRenderer {
 
 		self.clear_texture_cache();
 		unsafe {
-			gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+			gl.bind_framebuffer(glow::FRAMEBUFFER, self.target_framebuffer);
 		}
 
 		let blending = &components.drawable.blending;

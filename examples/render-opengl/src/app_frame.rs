@@ -21,7 +21,8 @@ use glutin_winit::{self, DisplayBuilder, GlWindow};
 pub trait App {
 	fn resume_window(&mut self, gl: glow::Context);
 	fn resize(&mut self, width: i32, height: i32);
-	fn draw(&mut self);
+	/// Draw the frame. Return `true` to exit the application.
+	fn draw(&mut self) -> bool;
 	fn handle_window_event(&mut self, event: WindowEvent, window_target: &EventLoopWindowTarget<()>);
 }
 
@@ -246,10 +247,14 @@ impl AppFrame {
 				},
 				Event::AboutToWait => {
 					if let Some((gl_context, gl_surface, window)) = &state {
-						app.draw();
+						let should_exit = app.draw();
 						window.request_redraw();
 
 						gl_surface.swap_buffers(gl_context).unwrap();
+
+						if should_exit {
+							window_target.exit();
+						}
 					}
 				}
 				_ => (),
