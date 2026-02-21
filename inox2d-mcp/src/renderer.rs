@@ -218,6 +218,9 @@ impl HeadlessRenderer {
 		gl_renderer.resize(width, height);
 		gl_renderer.camera.scale = Vec2::splat(0.15);
 
+		// Direct the renderer's composite output to our FBO instead of framebuffer 0
+		gl_renderer.set_target_framebuffer(Some(fbo));
+
 		Ok(Self {
 			gl_renderer,
 			gl: gl_for_fbo,

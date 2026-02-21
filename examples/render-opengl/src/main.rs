@@ -28,6 +28,9 @@ mod app_frame;
 struct Cli {
 	#[arg(help = "Path to the .inp or .inx file.")]
 	inp_path: PathBuf,
+	/// Save a screenshot to this path and exit after the first frame.
+	#[arg(long)]
+	screenshot: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -62,7 +65,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 			.with_title("Render Inochi2D Puppet (OpenGL)"),
 	)?;
 
-	app_frame.run(Inox2dOpenglExampleApp::new(model))?;
+	app_frame.run(Inox2dOpenglExampleApp::new(model, cli.screenshot))?;
 
 	Ok(())
 }
@@ -72,16 +75,60 @@ struct Inox2dOpenglExampleApp {
 	model: Model,
 	width: u32,
 	height: u32,
+	screenshot_path: Option<PathBuf>,
+	screenshot_requested: bool,
+	frame_count: u32,
 }
 
 impl Inox2dOpenglExampleApp {
-	pub fn new(model: Model) -> Self {
+	pub fn new(model: Model, screenshot: Option<PathBuf>) -> Self {
+		let auto_screenshot = screenshot.is_some();
 		Self {
 			on_window: None,
 			model,
 			width: 0,
 			height: 0,
+			screenshot_path: screenshot,
+			screenshot_requested: auto_screenshot,
+			frame_count: 0,
 		}
+	}
+
+	fn save_screenshot(gl: &glow::Context, width: u32, height: u32, path: &std::path::Path) {
+		use glow::HasContext;
+		use image::{ImageBuffer, Rgba};
+
+		let mut pixels = vec![0u8; (width * height * 4) as usize];
+
+		unsafe {
+			gl.read_pixels(
+				0,
+				0,
+				width as i32,
+				height as i32,
+				glow::RGBA,
+				glow::UNSIGNED_BYTE,
+				glow::PixelPackData::Slice(&mut pixels),
+			);
+		}
+
+		// Flip vertically (OpenGL reads bottom-to-top)
+		let row_bytes = width as usize * 4;
+		for y in 0..height as usize / 2 {
+			let top = y * row_bytes;
+			let bottom = (height as usize - 1 - y) * row_bytes;
+			for x in 0..row_bytes {
+				pixels.swap(top + x, bottom + x);
+			}
+		}
+
+		let img: ImageBuffer<Rgba<u8>, _> =
+			ImageBuffer::from_raw(width, height, pixels).unwrap();
+		let mut png_data = Vec::new();
+		let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+		img.write_with_encoder(encoder).unwrap();
+		fs::write(path, &png_data).unwrap();
+		tracing::info!("Screenshot saved to {:?} ({} bytes)", path, png_data.len());
 	}
 }
 
@@ -113,9 +160,9 @@ impl App for Inox2dOpenglExampleApp {
 		}
 	}
 
-	fn draw(&mut self) {
+	fn draw(&mut self) -> bool {
 		let Some((renderer, scene_ctrl)) = &mut self.on_window else {
-			return;
+			return false;
 		};
 
 		tracing::debug!("Redrawingggggg");
@@ -138,6 +185,19 @@ impl App for Inox2dOpenglExampleApp {
 		renderer.on_begin_draw(puppet);
 		renderer.draw(puppet);
 		renderer.on_end_draw(puppet);
+
+		self.frame_count += 1;
+
+		// Take screenshot after a few frames to let rendering stabilize
+		if self.screenshot_requested && self.frame_count > 3 {
+			self.screenshot_requested = false;
+			if let Some(path) = &self.screenshot_path {
+				Self::save_screenshot(renderer.gl(), self.width, self.height, path);
+				return true; // signal exit
+			}
+		}
+
+		false
 	}
 
 	fn handle_window_event(&mut self, event: WindowEvent, elwt: &EventLoopWindowTarget<()>) {
@@ -154,6 +214,19 @@ impl App for Inox2dOpenglExampleApp {
 			} => {
 				tracing::info!("There is an Escape D:");
 				elwt.exit();
+			}
+			WindowEvent::KeyboardInput {
+				event:
+					KeyEvent {
+						state: ElementState::Pressed,
+						physical_key: PhysicalKey::Code(KeyCode::KeyS),
+						..
+					},
+				..
+			} => {
+				if let Some((renderer, _)) = &self.on_window {
+					Self::save_screenshot(renderer.gl(), self.width, self.height, std::path::Path::new("/tmp/inox2d_screenshot.png"));
+				}
 			}
 			event => {
 				if let Some((renderer, scene_ctrl)) = &mut self.on_window {
