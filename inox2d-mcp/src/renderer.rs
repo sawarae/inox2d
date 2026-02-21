@@ -267,10 +267,14 @@ impl HeadlessRenderer {
 	///
 	/// `dt` is the elapsed time for physics simulation.
 	/// Pass `0.0` for the first frame.
+	///
+	/// `param_overrides` are applied between `begin_frame()` (which resets
+	/// params to defaults) and `end_frame()` (which applies them to nodes).
 	pub fn render_to_png(
 		&mut self,
 		puppet: &mut inox2d::puppet::Puppet,
 		dt: f32,
+		param_overrides: &std::collections::HashMap<String, Vec2>,
 	) -> Result<Vec<u8>, String> {
 		unsafe {
 			self.gl
@@ -284,6 +288,14 @@ impl HeadlessRenderer {
 		}
 
 		puppet.begin_frame();
+
+		// Apply user-set param overrides after begin_frame() reset
+		if let Some(param_ctx) = puppet.param_ctx.as_mut() {
+			for (name, val) in param_overrides {
+				let _ = param_ctx.set(name, *val);
+			}
+		}
+
 		puppet.end_frame(dt);
 
 		self.gl_renderer.on_begin_draw(puppet);

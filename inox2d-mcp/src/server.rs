@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::sync::Mutex;
 
@@ -16,6 +17,9 @@ use inox2d::model::Model;
 pub struct PuppetState {
 	pub model: Model,
 	pub renderer: HeadlessRenderer,
+	/// User-set param overrides. Applied between begin_frame() and end_frame()
+	/// since begin_frame() resets all params to defaults.
+	pub param_overrides: HashMap<String, Vec2>,
 }
 
 // Safety: PuppetState contains GL resources with raw pointers, but we only access
@@ -142,6 +146,7 @@ impl InoxMcpServer {
 		*state = Some(PuppetState {
 			model,
 			renderer: headless,
+			param_overrides: HashMap::new(),
 		});
 
 		let info = serde_json::json!({
@@ -224,19 +229,21 @@ impl InoxMcpServer {
 			None => return Ok(error_result("No puppet loaded. Call load_puppet first.")),
 		};
 
-		let param_ctx = match state.model.puppet.param_ctx.as_mut() {
-			Some(ctx) => ctx,
-			None => return Ok(error_result("Puppet params not initialized.")),
-		};
+		// Validate param name exists
+		if !state.model.puppet.params.contains_key(&params.name) {
+			return Ok(error_result(format!(
+				"No parameter named '{}'",
+				params.name
+			)));
+		}
 
 		let val = Vec2::new(params.x, params.y.unwrap_or(0.0));
-		match param_ctx.set(&params.name, val) {
-			Ok(()) => Ok(text_result(format!(
-				"Parameter '{}' set to ({}, {})",
-				params.name, val.x, val.y
-			))),
-			Err(e) => Ok(error_result(format!("Failed to set parameter: {e}"))),
-		}
+		state.param_overrides.insert(params.name.clone(), val);
+
+		Ok(text_result(format!(
+			"Parameter '{}' set to ({}, {})",
+			params.name, val.x, val.y
+		)))
 	}
 
 	/// Render the current puppet state to a PNG image. Returns base64-encoded PNG data or saves to a file path.
@@ -257,7 +264,10 @@ impl InoxMcpServer {
 		}
 
 		// Render
-		let png_data = match state.renderer.render_to_png(&mut state.model.puppet, 0.0) {
+		let png_data = match state
+			.renderer
+			.render_to_png(&mut state.model.puppet, 0.0, &state.param_overrides)
+		{
 			Ok(data) => data,
 			Err(e) => return Ok(error_result(format!("Render failed: {e}"))),
 		};
