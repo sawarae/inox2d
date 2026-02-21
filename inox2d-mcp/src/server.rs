@@ -70,6 +70,10 @@ pub struct RenderParams {
 	pub height: Option<u32>,
 	/// File path to save the PNG to. If not specified, returns base64-encoded image content.
 	pub output_path: Option<String>,
+	/// Elapsed time in seconds for physics simulation (hair, clothes, etc.).
+	/// The renderer will step physics this many times at 1/60s intervals.
+	/// Default: 0.0 (no physics).
+	pub dt: Option<f32>,
 }
 
 fn text_result(text: impl Into<String>) -> CallToolResult {
@@ -263,7 +267,21 @@ impl InoxMcpServer {
 			state.renderer.resize(w, h);
 		}
 
-		// Render
+		// Run physics warm-up frames if dt is specified
+		let dt = params.dt.unwrap_or(0.0);
+		if dt > 0.0 {
+			let step = 1.0 / 60.0_f32;
+			let steps = (dt / step).ceil() as u32;
+			for _ in 0..steps {
+				state.renderer.render_to_png(
+					&mut state.model.puppet,
+					step,
+					&state.param_overrides,
+				).ok();
+			}
+		}
+
+		// Final render
 		let png_data = match state
 			.renderer
 			.render_to_png(&mut state.model.puppet, 0.0, &state.param_overrides)
