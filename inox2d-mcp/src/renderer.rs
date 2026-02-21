@@ -1,5 +1,4 @@
-use std::ffi::CString;
-use std::num::NonZeroU32;
+use std::ptr;
 
 use glow::HasContext;
 use image::{ImageBuffer, Rgba};
@@ -9,23 +8,21 @@ use inox2d::render::InoxRendererExt;
 use inox2d_opengl::OpenglRenderer;
 
 use glam::Vec2;
-use glutin::config::ConfigTemplateBuilder;
-use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
-use glutin::display::{Display, DisplayApiPreference};
-use glutin::prelude::*;
-use glutin::surface::{PbufferSurface, Surface, SurfaceAttributesBuilder};
 
-use raw_window_handle::{AppKitDisplayHandle, RawDisplayHandle};
-
-/// Holds the GL context and surface needed to keep them alive.
-///
-/// These fields are never directly read, but must be kept alive to
-/// maintain the GL context. Dropping them would invalidate the context.
-#[allow(dead_code)]
+/// Raw CGL context that must be kept alive for GL operations.
 pub struct GlState {
-	gl_context: PossiblyCurrentContext,
-	gl_surface: Surface<PbufferSurface>,
-	gl_display: Display,
+	cgl_context: cgl::CGLContextObj,
+	cgl_pixel_format: cgl::CGLPixelFormatObj,
+}
+
+impl Drop for GlState {
+	fn drop(&mut self) {
+		unsafe {
+			cgl::CGLSetCurrentContext(ptr::null_mut());
+			cgl::CGLDestroyContext(self.cgl_context);
+			cgl::CGLDestroyPixelFormat(self.cgl_pixel_format);
+		}
+	}
 }
 
 /// Headless OpenGL renderer for inox2d puppets.
@@ -41,71 +38,93 @@ pub struct HeadlessRenderer {
 	_gl_state: GlState,
 }
 
-/// Load a glow::Context from a glutin display.
-fn load_gl(display: &Display) -> glow::Context {
-	unsafe {
-		glow::Context::from_loader_function(|symbol| {
-			display.get_proc_address(&CString::new(symbol).unwrap()) as *const _
-		})
+/// Load a GL function pointer from OpenGL.framework via dlsym.
+fn load_gl_symbol(symbol: &str) -> *const std::ffi::c_void {
+	use std::ffi::CString;
+	extern "C" {
+		fn dlopen(filename: *const i8, flags: i32) -> *mut std::ffi::c_void;
+		fn dlsym(handle: *mut std::ffi::c_void, symbol: *const i8) -> *mut std::ffi::c_void;
 	}
+	const RTLD_LAZY: i32 = 0x1;
+
+	struct SendPtr(*mut std::ffi::c_void);
+	unsafe impl Send for SendPtr {}
+	unsafe impl Sync for SendPtr {}
+
+	static OPENGL_LIB: std::sync::OnceLock<SendPtr> = std::sync::OnceLock::new();
+	let handle = OPENGL_LIB.get_or_init(|| unsafe {
+		let path =
+			CString::new("/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL")
+				.unwrap();
+		SendPtr(dlopen(path.as_ptr(), RTLD_LAZY))
+	}).0;
+
+	if handle.is_null() {
+		return ptr::null();
+	}
+
+	let name = CString::new(symbol).unwrap();
+	unsafe { dlsym(handle, name.as_ptr()) as *const std::ffi::c_void }
 }
 
-/// Create a headless OpenGL context on macOS using CGL via glutin.
+/// Create a headless OpenGL context on macOS using CGL directly.
+///
+/// CGL allows `CGLSetCurrentContext` without a drawable, which is
+/// sufficient for FBO-based offscreen rendering.
 ///
 /// Returns two glow contexts (one for the renderer, one for FBO ops) and the GL state.
 pub fn create_headless_gl_context() -> Result<(glow::Context, glow::Context, GlState), String> {
-	// On macOS, create a CGL display
-	let display = unsafe {
-		Display::new(
-			RawDisplayHandle::AppKit(AppKitDisplayHandle::empty()),
-			DisplayApiPreference::Cgl,
-		)
+	unsafe {
+		// kCGLOGLPVersion_3_2_Core = 0x3200 (not exported by the cgl crate)
+		const KCG_LOGLP_VERSION_3_2_CORE: cgl::CGLPixelFormatAttribute = 0x3200;
+
+		let attribs: [cgl::CGLPixelFormatAttribute; 9] = [
+			cgl::kCGLPFAOpenGLProfile,
+			KCG_LOGLP_VERSION_3_2_CORE,
+			cgl::kCGLPFAColorSize,
+			24,
+			cgl::kCGLPFAAlphaSize,
+			8,
+			cgl::kCGLPFADepthSize,
+			24,
+			0, // terminator
+		];
+
+		let mut pixel_format: cgl::CGLPixelFormatObj = ptr::null_mut();
+		let mut num_formats: cgl::GLint = 0;
+
+		let err =
+			cgl::CGLChoosePixelFormat(attribs.as_ptr(), &mut pixel_format, &mut num_formats);
+		if err != cgl::kCGLNoError || pixel_format.is_null() {
+			return Err(format!("CGLChoosePixelFormat failed: error {err}"));
+		}
+
+		let mut cgl_context: cgl::CGLContextObj = ptr::null_mut();
+		let err = cgl::CGLCreateContext(pixel_format, ptr::null_mut(), &mut cgl_context);
+		if err != cgl::kCGLNoError || cgl_context.is_null() {
+			cgl::CGLDestroyPixelFormat(pixel_format);
+			return Err(format!("CGLCreateContext failed: error {err}"));
+		}
+
+		let err = cgl::CGLSetCurrentContext(cgl_context);
+		if err != cgl::kCGLNoError {
+			cgl::CGLDestroyContext(cgl_context);
+			cgl::CGLDestroyPixelFormat(pixel_format);
+			return Err(format!("CGLSetCurrentContext failed: error {err}"));
+		}
+
+		let gl_for_renderer =
+			glow::Context::from_loader_function(|s| load_gl_symbol(s) as *const _);
+		let gl_for_fbo =
+			glow::Context::from_loader_function(|s| load_gl_symbol(s) as *const _);
+
+		let state = GlState {
+			cgl_context,
+			cgl_pixel_format: pixel_format,
+		};
+
+		Ok((gl_for_renderer, gl_for_fbo, state))
 	}
-	.map_err(|e| format!("Failed to create display: {e}"))?;
-
-	let template = ConfigTemplateBuilder::new().with_alpha_size(8).build();
-
-	let config = unsafe { display.find_configs(template) }
-		.map_err(|e| format!("Failed to find configs: {e}"))?
-		.next()
-		.ok_or_else(|| "No suitable GL config found".to_string())?;
-
-	// Create context
-	let context_attrs = ContextAttributesBuilder::new().build(None);
-	let fallback_attrs = ContextAttributesBuilder::new()
-		.with_context_api(ContextApi::OpenGl(Some(Version::new(2, 1))))
-		.build(None);
-
-	let not_current_ctx = unsafe {
-		display
-			.create_context(&config, &context_attrs)
-			.or_else(|_| display.create_context(&config, &fallback_attrs))
-	}
-	.map_err(|e| format!("Failed to create context: {e}"))?;
-
-	// Create a small pbuffer surface to make context current
-	let surface_attrs = SurfaceAttributesBuilder::<PbufferSurface>::new()
-		.build(NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
-	let surface = unsafe { display.create_pbuffer_surface(&config, &surface_attrs) }
-		.map_err(|e| format!("Failed to create pbuffer surface: {e}"))?;
-
-	// Make current
-	let gl_context = not_current_ctx
-		.make_current(&surface)
-		.map_err(|e| format!("Failed to make context current: {e}"))?;
-
-	// Load two separate glow::Context instances from the same display.
-	// Both share the same underlying GL context state.
-	let gl_for_renderer = load_gl(&display);
-	let gl_for_fbo = load_gl(&display);
-
-	let state = GlState {
-		gl_context,
-		gl_surface: surface,
-		gl_display: display,
-	};
-
-	Ok((gl_for_renderer, gl_for_fbo, state))
 }
 
 impl HeadlessRenderer {
@@ -150,8 +169,16 @@ impl HeadlessRenderer {
 				glow::UNSIGNED_BYTE,
 				None,
 			);
-			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+			gl.tex_parameter_i32(
+				glow::TEXTURE_2D,
+				glow::TEXTURE_MIN_FILTER,
+				glow::LINEAR as i32,
+			);
+			gl.tex_parameter_i32(
+				glow::TEXTURE_2D,
+				glow::TEXTURE_MAG_FILTER,
+				glow::LINEAR as i32,
+			);
 
 			// Setup depth/stencil attachment
 			gl.bind_renderbuffer(glow::RENDERBUFFER, Some(rbo));
@@ -211,7 +238,6 @@ impl HeadlessRenderer {
 		unsafe {
 			let gl = &self.gl;
 
-			// Resize color texture
 			gl.bind_texture(glow::TEXTURE_2D, Some(self.fbo_texture));
 			gl.tex_image_2d(
 				glow::TEXTURE_2D,
@@ -225,7 +251,6 @@ impl HeadlessRenderer {
 				None,
 			);
 
-			// Resize depth/stencil renderbuffer
 			gl.bind_renderbuffer(glow::RENDERBUFFER, Some(self.fbo_depth_stencil));
 			gl.renderbuffer_storage(
 				glow::RENDERBUFFER,
@@ -242,31 +267,29 @@ impl HeadlessRenderer {
 	///
 	/// `dt` is the elapsed time for physics simulation.
 	/// Pass `0.0` for the first frame.
-	pub fn render_to_png(&mut self, puppet: &mut inox2d::puppet::Puppet, dt: f32) -> Result<Vec<u8>, String> {
+	pub fn render_to_png(
+		&mut self,
+		puppet: &mut inox2d::puppet::Puppet,
+		dt: f32,
+	) -> Result<Vec<u8>, String> {
 		unsafe {
-			// Bind our FBO
 			self.gl
 				.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
 			self.gl
 				.viewport(0, 0, self.width as i32, self.height as i32);
-
-			// Clear
 			self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
 			self.gl.clear(
 				glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT,
 			);
 		}
 
-		// Run puppet frame
 		puppet.begin_frame();
 		puppet.end_frame(dt);
 
-		// Draw
 		self.gl_renderer.on_begin_draw(puppet);
 		self.gl_renderer.draw(puppet);
 		self.gl_renderer.on_end_draw(puppet);
 
-		// Read pixels
 		let pixel_count = (self.width * self.height) as usize;
 		let mut pixels = vec![0u8; pixel_count * 4];
 
@@ -295,9 +318,9 @@ impl HeadlessRenderer {
 			}
 		}
 
-		// Encode as PNG
-		let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(self.width, self.height, pixels)
-			.ok_or_else(|| "Failed to create image buffer".to_string())?;
+		let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+			ImageBuffer::from_raw(self.width, self.height, pixels)
+				.ok_or_else(|| "Failed to create image buffer".to_string())?;
 
 		let mut png_data = Vec::new();
 		let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
