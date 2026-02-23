@@ -9,12 +9,15 @@ use inox2d_opengl::OpenglRenderer;
 
 use glam::Vec2;
 
-/// Raw CGL context that must be kept alive for GL operations.
+// ─── macOS (CGL) ──────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
 pub struct GlState {
 	cgl_context: cgl::CGLContextObj,
 	cgl_pixel_format: cgl::CGLPixelFormatObj,
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for GlState {
 	fn drop(&mut self) {
 		unsafe {
@@ -25,20 +28,8 @@ impl Drop for GlState {
 	}
 }
 
-/// Headless OpenGL renderer for inox2d puppets.
-pub struct HeadlessRenderer {
-	pub gl_renderer: OpenglRenderer,
-	/// Separate glow context for FBO operations (shares GL state with renderer's context).
-	gl: glow::Context,
-	pub fbo: glow::Framebuffer,
-	pub fbo_texture: glow::Texture,
-	pub fbo_depth_stencil: glow::Renderbuffer,
-	pub width: u32,
-	pub height: u32,
-	_gl_state: GlState,
-}
-
 /// Load a GL function pointer from OpenGL.framework via dlsym.
+#[cfg(target_os = "macos")]
 fn load_gl_symbol(symbol: &str) -> *const std::ffi::c_void {
 	use std::ffi::CString;
 	extern "C" {
@@ -68,11 +59,7 @@ fn load_gl_symbol(symbol: &str) -> *const std::ffi::c_void {
 }
 
 /// Create a headless OpenGL context on macOS using CGL directly.
-///
-/// CGL allows `CGLSetCurrentContext` without a drawable, which is
-/// sufficient for FBO-based offscreen rendering.
-///
-/// Returns two glow contexts (one for the renderer, one for FBO ops) and the GL state.
+#[cfg(target_os = "macos")]
 pub fn create_headless_gl_context() -> Result<(glow::Context, glow::Context, GlState), String> {
 	unsafe {
 		// kCGLOGLPVersion_3_2_Core = 0x3200 (not exported by the cgl crate)
@@ -125,6 +112,182 @@ pub fn create_headless_gl_context() -> Result<(glow::Context, glow::Context, GlS
 
 		Ok((gl_for_renderer, gl_for_fbo, state))
 	}
+}
+
+// ─── Linux (EGL) ──────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+pub struct GlState {
+	egl: khronos_egl::DynamicInstance<khronos_egl::EGL1_4>,
+	display: khronos_egl::Display,
+	context: khronos_egl::Context,
+	surface: khronos_egl::Surface,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GlState {
+	fn drop(&mut self) {
+		let _ = self.egl.make_current(self.display, None, None, None);
+		let _ = self.egl.destroy_surface(self.display, self.surface);
+		let _ = self.egl.destroy_context(self.display, self.context);
+		let _ = self.egl.terminate(self.display);
+	}
+}
+
+/// Load an OpenGL symbol via eglGetProcAddress, with dlsym fallback.
+#[cfg(target_os = "linux")]
+fn load_gl_symbol_egl(
+	egl: &khronos_egl::DynamicInstance<khronos_egl::EGL1_4>,
+	symbol: &str,
+) -> *const std::ffi::c_void {
+	// Try eglGetProcAddress first
+	if let Some(f) = egl.get_proc_address(symbol) {
+		return f as *const std::ffi::c_void;
+	}
+
+	// Fall back to dlsym on libGL.so.1
+	use std::ffi::CString;
+	extern "C" {
+		fn dlopen(filename: *const i8, flags: i32) -> *mut std::ffi::c_void;
+		fn dlsym(handle: *mut std::ffi::c_void, symbol: *const i8) -> *mut std::ffi::c_void;
+	}
+	const RTLD_LAZY: i32 = 0x1;
+	const RTLD_GLOBAL: i32 = 0x100;
+
+	struct SendPtr(*mut std::ffi::c_void);
+	unsafe impl Send for SendPtr {}
+	unsafe impl Sync for SendPtr {}
+
+	static LIBGL: std::sync::OnceLock<SendPtr> = std::sync::OnceLock::new();
+	let handle = LIBGL.get_or_init(|| unsafe {
+		// Try libGL.so.1 first, then libGL.so
+		let path1 = CString::new("libGL.so.1").unwrap();
+		let h = dlopen(path1.as_ptr(), RTLD_LAZY | RTLD_GLOBAL);
+		if !h.is_null() {
+			return SendPtr(h);
+		}
+		let path2 = CString::new("libGL.so").unwrap();
+		SendPtr(dlopen(path2.as_ptr(), RTLD_LAZY | RTLD_GLOBAL))
+	}).0;
+
+	if handle.is_null() {
+		return ptr::null();
+	}
+
+	let name = CString::new(symbol).unwrap();
+	unsafe { dlsym(handle, name.as_ptr()) as *const std::ffi::c_void }
+}
+
+/// Create a headless OpenGL context on Linux using EGL with a pbuffer surface.
+#[cfg(target_os = "linux")]
+pub fn create_headless_gl_context() -> Result<(glow::Context, glow::Context, GlState), String> {
+	use khronos_egl as egl;
+
+	let instance = unsafe {
+		egl::DynamicInstance::<egl::EGL1_4>::load_required()
+			.map_err(|e| format!("Failed to load EGL: {e}"))?
+	};
+
+	let display = unsafe {
+		instance
+			.get_display(egl::DEFAULT_DISPLAY)
+			.ok_or("No default EGL display available")?
+	};
+
+	instance
+		.initialize(display)
+		.map_err(|e| format!("EGL initialize failed: {e}"))?;
+
+	instance
+		.bind_api(egl::OPENGL_API)
+		.map_err(|_| "Failed to bind OpenGL API (EGL_KHR_client_get_all_proc_addresses may be needed)")?;
+
+	let config_attribs = [
+		egl::RED_SIZE,
+		8,
+		egl::GREEN_SIZE,
+		8,
+		egl::BLUE_SIZE,
+		8,
+		egl::ALPHA_SIZE,
+		8,
+		egl::DEPTH_SIZE,
+		24,
+		egl::STENCIL_SIZE,
+		8,
+		egl::RENDERABLE_TYPE,
+		egl::OPENGL_BIT,
+		egl::SURFACE_TYPE,
+		egl::PBUFFER_BIT,
+		egl::NONE,
+	];
+
+	let config = instance
+		.choose_first_config(display, &config_attribs)
+		.map_err(|e| format!("EGL choose config failed: {e}"))?
+		.ok_or("No suitable EGL config found (OpenGL + pbuffer)")?;
+
+	let pbuffer_attribs = [egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE];
+
+	let surface = instance
+		.create_pbuffer_surface(display, config, &pbuffer_attribs)
+		.map_err(|e| format!("EGL create pbuffer surface failed: {e}"))?;
+
+	// EGL 1.5 / EGL_KHR_create_context attribute values
+	const EGL_CONTEXT_MAJOR_VERSION: egl::Int = 0x3098;
+	const EGL_CONTEXT_MINOR_VERSION: egl::Int = 0x30FB;
+
+	let ctx_attribs = [
+		EGL_CONTEXT_MAJOR_VERSION,
+		3,
+		EGL_CONTEXT_MINOR_VERSION,
+		2,
+		egl::NONE,
+	];
+
+	let context = instance
+		.create_context(display, config, None, &ctx_attribs)
+		.map_err(|e| format!("EGL create context failed: {e}"))?;
+
+	instance
+		.make_current(display, Some(surface), Some(surface), Some(context))
+		.map_err(|e| format!("EGL make current failed: {e}"))?;
+
+	let gl_for_renderer = unsafe {
+		glow::Context::from_loader_function(|s| load_gl_symbol_egl(&instance, s))
+	};
+	let gl_for_fbo = unsafe {
+		glow::Context::from_loader_function(|s| load_gl_symbol_egl(&instance, s))
+	};
+
+	let state = GlState {
+		egl: instance,
+		display,
+		context,
+		surface,
+	};
+
+	Ok((gl_for_renderer, gl_for_fbo, state))
+}
+
+// ─── Unsupported platforms ────────────────────────────────────────────────────
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("inox2d-mcp only supports macOS and Linux");
+
+// ─── Platform-agnostic HeadlessRenderer ──────────────────────────────────────
+
+/// Headless OpenGL renderer for inox2d puppets.
+pub struct HeadlessRenderer {
+	pub gl_renderer: OpenglRenderer,
+	/// Separate glow context for FBO operations (shares GL state with renderer's context).
+	gl: glow::Context,
+	pub fbo: glow::Framebuffer,
+	pub fbo_texture: glow::Texture,
+	pub fbo_depth_stencil: glow::Renderbuffer,
+	pub width: u32,
+	pub height: u32,
+	_gl_state: GlState,
 }
 
 impl HeadlessRenderer {
