@@ -298,7 +298,7 @@ impl OpenglRenderer {
 			match blend_mode {
 				BlendMode::Normal => {
 					gl.blend_equation(glow::FUNC_ADD);
-					gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+					gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
 				}
 				BlendMode::Multiply => {
 					gl.blend_equation(glow::FUNC_ADD);
@@ -577,7 +577,7 @@ impl InoxRenderer for OpenglRenderer {
 
 			// Everything else is the actual texture used by the meshes at id 0
 			gl.active_texture(glow::TEXTURE0);
-			gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+			gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
 		}
 
 		self.pop_debug_group();

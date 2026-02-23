@@ -50,8 +50,11 @@ impl AppFrame {
 			ConfigTemplateBuilder::new()
 				.with_alpha_size(8)
 				.with_transparency(cfg!(target_os = "macos"))
+				.with_multisampling(4)
 		} else {
-			ConfigTemplateBuilder::new().with_transparency(false)
+			ConfigTemplateBuilder::new()
+				.with_multisampling(4)
+				.with_transparency(false)
 		};
 
 		// Only Windows requires the window to be present before creating the display.
